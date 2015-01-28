@@ -140,6 +140,10 @@
 #include <linux/i2c/synaptics_touchpad.h>
 #endif
 
+#include <linux/if.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+
 #include "wifi-zeus.h"
 
 #ifdef CONFIG_SENSORS_AKM8975
@@ -182,25 +186,9 @@
 
 #define MSM_FB_SIZE roundup(MSM_FB_PRIM_BUF_SIZE + MSM_FB_EXT_BUF_SIZE, 4096)
 
-#ifdef CONFIG_MSM_ION_MM_USE_CMA
-#define MSM_DMA_CONTIGUOUS_BASE		0x0
-#define MSM_DMA_CONTIGUOUS_LIMIT	0x20000000
-static u64 msm_dmamask = DMA_BIT_MASK(32);
-#endif
-
-#ifdef CONFIG_ANDROID_PMEM
-#ifndef CONFIG_ANDROID_PMEM_ION_WRAPPER
-#define MSM_PMEM_ADSP_SIZE      0x242A000
-#endif
-#endif
-
 #ifdef CONFIG_ION_MSM
 static struct platform_device ion_dev;
-#ifdef CONFIG_MSM_ION_MM_USE_CMA
 #define MSM_ION_MM_SIZE		0x3000000
-#else
-#define MSM_ION_MM_SIZE		0x1C80000
-#endif
 #define MSM_ION_AUDIO_SIZE	0x200000
 #define MSM_ION_SF_SIZE		0x1E00000
 #define MSM_ION_WB_SIZE		MSM_FB_OVERLAY0_WRITEBACK_SIZE
@@ -2382,16 +2370,10 @@ static struct platform_device msm_migrate_pages_device = {
 	.id     = -1,
 };
 
-#ifdef CONFIG_ANDROID_PMEM
+#ifdef CONFIG_ANDROID_PMEM_ION_WRAPPER
 static struct android_pmem_platform_data android_pmem_adsp_pdata = {
 	.name = "pmem_adsp",
-#ifndef CONFIG_ANDROID_PMEM_ION_WRAPPER
-	.allocator_type = PMEM_ALLOCATORTYPE_BITMAP,
-	.cached = 1,
-	.memory_type = MEMTYPE_EBI0,
-#else
 	.ion_heap_id = ION_CP_MM_HEAP_ID,
-#endif
 };
 
 static struct platform_device android_pmem_adsp_device = {
@@ -2804,7 +2786,7 @@ static struct platform_device *devices[] __initdata = {
 #ifdef CONFIG_MSM_ROTATOR
 	&msm_rotator_device,
 #endif
-#ifdef CONFIG_ANDROID_PMEM
+#ifdef CONFIG_ANDROID_PMEM_ION_WRAPPER
 	&android_pmem_adsp_device,
 #endif
 	&msm_device_i2c,
@@ -3398,6 +3380,78 @@ struct platform_device semc_reset_keys_device = {
 };
 #endif
 
+unsigned bt_mac_addr[IFHWADDRLEN];
+unsigned wifi_mac_addr[IFHWADDRLEN];
+
+#ifdef CONFIG_PROC_FS
+static void *frag_start(struct seq_file *m, loff_t *pos)
+{
+	pg_data_t *pgdat;
+	loff_t node = *pos;
+	for (pgdat = first_online_pgdat();
+	     pgdat && node;
+	     pgdat = next_online_pgdat(pgdat))
+		--node;
+
+	return pgdat;
+}
+
+static void *frag_next(struct seq_file *m, void *arg, loff_t *pos)
+{
+	pg_data_t *pgdat = (pg_data_t *)arg;
+
+	(*pos)++;
+	return next_online_pgdat(pgdat);
+}
+
+static void frag_stop(struct seq_file *m, void *arg)
+{
+}
+
+static int bt_addr_file_show(struct seq_file *m, void *arg)
+{
+	seq_printf(m, "%02X:%02X:%02X:%02X:%02X:%02X\n",
+		bt_mac_addr[0], bt_mac_addr[1], bt_mac_addr[2],
+		bt_mac_addr[3], bt_mac_addr[4], bt_mac_addr[5]);
+	return 0;
+};
+
+static const struct seq_operations bt_addr_file_op = {
+	.start		= frag_start,
+	.next		= frag_next,
+	.stop		= frag_stop,
+	.show		= bt_addr_file_show,
+};
+
+static int bt_addr_file_open(struct inode *inode, struct file *file)
+{
+	return seq_open(file, &bt_addr_file_op);
+};
+
+static const struct file_operations bt_addr_file_ops = {
+	.open		= bt_addr_file_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= seq_release,
+};
+#endif
+
+static int __init bt_addr_proc_init(void)
+{
+#ifdef CONFIG_PROC_FS
+	proc_create("bt_mac_addr", S_IRUGO, NULL, &bt_addr_file_ops);
+#endif
+	return 0;
+}
+
+int zeus_get_wlanmac(uint8_t *wlanmac)
+{
+	int i = IFHWADDRLEN;
+	while (i-- > 0)
+		wlanmac[i] = wifi_mac_addr[i];
+	return 0;
+};
+
 static void __init msm7x30_init(void)
 {
 	unsigned smem_size;
@@ -3444,6 +3498,7 @@ static void __init msm7x30_init(void)
 #ifdef CONFIG_INPUT_KEYRESET
 	platform_device_register(&semc_reset_keys_device);
 #endif
+	bt_addr_proc_init();
 #ifdef CONFIG_MSM_BT_POWER
 	bluetooth_power_init();
 #endif
@@ -3508,7 +3563,8 @@ static struct ion_co_heap_pdata co_mm_ion_pdata = {
 	.align = PAGE_SIZE,
 };
 
-#ifdef CONFIG_MSM_ION_MM_USE_CMA
+static u64 msm_dmamask = DMA_BIT_MASK(32);
+
 static struct platform_device ion_mm_heap_device = {
 	.name = "ion-mm-heap-device",
 	.id = -1,
@@ -3517,7 +3573,6 @@ static struct platform_device ion_mm_heap_device = {
 		.coherent_dma_mask = DMA_BIT_MASK(32),
 	}
 };
-#endif
 #endif
 
 /**
@@ -3534,17 +3589,11 @@ struct ion_platform_heap msm7x30_heaps[] = {
 		/* MM */
 		{
 			.id	= ION_CP_MM_HEAP_ID,
-#ifdef CONFIG_MSM_ION_MM_USE_CMA
 			.type	= ION_HEAP_TYPE_DMA,
-#else
-			.type	= ION_HEAP_TYPE_CARVEOUT,
-#endif
 			.name	= ION_MM_HEAP_NAME,
 			.memory_type = ION_EBI_TYPE,
 			.extra_data = (void *)&co_mm_ion_pdata,
-#ifdef CONFIG_MSM_ION_MM_USE_CMA
 			.priv	= (void *)&ion_mm_heap_device.dev,
-#endif
 		},
 		/* AUDIO */
 		{
@@ -3596,24 +3645,6 @@ static struct memtype_reserve msm7x30_reserve_table[] __initdata = {
 	},
 };
 
-static void __init size_pmem_devices(void)
-{
-#ifdef CONFIG_ANDROID_PMEM
-#ifndef CONFIG_ANDROID_PMEM_ION_WRAPPER
-	android_pmem_adsp_pdata.size = MSM_PMEM_ADSP_SIZE;
-#endif
-#endif
-}
-
-static void __init reserve_pmem_memory(void)
-{
-#ifdef CONFIG_ANDROID_PMEM
-#ifndef CONFIG_ANDROID_PMEM_ION_WRAPPER
-	msm7x30_reserve_table[MEMTYPE_EBI0].size += MSM_PMEM_ADSP_SIZE;
-#endif
-#endif
-}
-
 static void __init reserve_mdp_memory(void)
 {
 	mdp_pdata.ov0_wb_size = MSM_FB_OVERLAY0_WRITEBACK_SIZE;
@@ -3632,9 +3663,6 @@ static void __init size_ion_devices(void)
 static void __init reserve_ion_memory(void)
 {
 #ifdef CONFIG_MSM_MULTIMEDIA_USE_ION
-#ifndef CONFIG_MSM_ION_MM_USE_CMA
-	msm7x30_reserve_table[MEMTYPE_EBI0].size += MSM_ION_MM_SIZE;
-#endif
 	msm7x30_reserve_table[MEMTYPE_EBI0].size += MSM_ION_AUDIO_SIZE;
 	msm7x30_reserve_table[MEMTYPE_EBI0].size += MSM_ION_SF_SIZE;
 	msm7x30_reserve_table[MEMTYPE_EBI0].size += MSM_ION_WB_SIZE;
@@ -3643,8 +3671,6 @@ static void __init reserve_ion_memory(void)
 
 static void __init msm7x30_calculate_reserve_sizes(void)
 {
-	size_pmem_devices();
-	reserve_pmem_memory();
 	reserve_mdp_memory();
 	size_ion_devices();
 	reserve_ion_memory();
@@ -3669,12 +3695,12 @@ static void __init msm7x30_reserve(void)
 {
 	reserve_info = &msm7x30_reserve_info;
 	msm_reserve();
-#ifdef CONFIG_MSM_ION_MM_USE_CMA
+#ifdef CONFIG_CMA
 	dma_declare_contiguous(
 			&ion_mm_heap_device.dev,
 			MSM_ION_MM_SIZE,
-			MSM_DMA_CONTIGUOUS_BASE,
-			MSM_DMA_CONTIGUOUS_LIMIT);
+			0x0,
+			0x20000000);
 #endif
 #ifdef CONFIG_ANDROID_PERSISTENT_RAM
 	add_persistent_ram();
@@ -3725,6 +3751,25 @@ static void __init msm7x30_fixup_sn(char *kernel_cmdline, char *bl_cmdline)
 	strlcat(kernel_cmdline, serialno, COMMAND_LINE_SIZE);
 }
 
+#define CMDLINE_BOOTMODE "startup="
+static void __init msm7x30_fixup_bm(char *kernel_cmdline, char *bl_cmdline)
+{
+	char bootmode[11];
+	/* Find bootmode start position. */
+	char *bootmode_start = strstr(bl_cmdline,
+		CMDLINE_BOOTMODE) + sizeof(CMDLINE_BOOTMODE) - 1;
+
+	/* Copy bootmode to it's own buffer. */
+	strncpy(bootmode, bootmode_start, ARRAY_SIZE(bootmode));
+	bootmode[10] = '\0';
+
+	/* Enter the bootmode in correct format. */
+	if (!strcmp(bootmode, "0x00000020")) {
+		strlcat(kernel_cmdline,
+			" androidboot.mode=charger", COMMAND_LINE_SIZE);
+	}
+}
+
 static void __init msm7x30_fixup(struct tag *tags, char **cmdline,
 				 struct meminfo *mi)
 {
@@ -3739,11 +3784,31 @@ static void __init msm7x30_fixup(struct tag *tags, char **cmdline,
 	for (; tags->hdr.size; tags = tag_next(tags)) {
 		if (tags->hdr.tag == ATAG_CMDLINE) {
 			msm7x30_fixup_sn(*cmdline, tags->u.cmdline.cmdline);
+			msm7x30_fixup_bm(*cmdline, tags->u.cmdline.cmdline);
 			break;
 		}
 	}
 
 }
+
+static int __init board_bt_addr_setup(char *btaddr)
+{
+	sscanf(btaddr, "%02X:%02X:%02X:%02X:%02X:%02X",
+		&bt_mac_addr[0], &bt_mac_addr[1], &bt_mac_addr[2],
+		&bt_mac_addr[3], &bt_mac_addr[4], &bt_mac_addr[5]);
+	return 1;
+};
+
+static int __init board_wifi_addr_setup(char *wifiaddr)
+{
+	sscanf(wifiaddr, "%02X:%02X:%02X:%02X:%02X:%02X",
+		&wifi_mac_addr[0], &wifi_mac_addr[1], &wifi_mac_addr[2],
+		&wifi_mac_addr[3], &wifi_mac_addr[4], &wifi_mac_addr[5]);
+	return 1;
+};
+
+__setup("bt0.ieee_addr=", board_bt_addr_setup);
+__setup("wifi0.eth_addr=", board_wifi_addr_setup);
 
 MACHINE_START(SEMC_ZEUS, "zeus")
 	.atag_offset = 0x100,
